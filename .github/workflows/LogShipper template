@@ -1,0 +1,145 @@
+name : Drupal Log Shipper Template
+on:
+ concurrency:drupal log-shipper
+ 
+ 
+ jobs:
+ 
+  drupal-log-shipper:
+   runs-on: Ubuntu-latest
+   env:
+     ENVS: <ENVS>
+     LOGNAMES: <LOGNAMES>
+     CURRENTDATE: <CURRENTDATE>
+     CURRENTTIME: <CURRENTTIME>
+     CURRENTDATECURL: <CURRENTDATECURL>
+     CURRENTENDDATECURL: <CURRENTENDDATECURL>
+     
+     
+   steps:
+     # ==================================================
+     # Login to Azure CLI                              
+     # ==================================================
+      - name: "Login to Azure CLI"
+        uses: Azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }} 
+        
+      # ==================================================
+      # Get Secrets From Vault                              
+      # ==================================================        
+      - name: "Retrieve Secrets From Vault"
+        uses: Azure/get-keyvault-secrets@v1
+        with:
+          keyvault: "< KEYVAULT NAME >"
+          secrets: 'documentum_password, credentialsId, documentum_username ' 
+           id: VaultSecrets
+      # ==================================================
+      # Check the current time                              
+      # ==================================================        
+      - name: "Retrieve Current based on currenttime"
+        if : ${CURRENTIME} -lt "0010"
+        env:
+         CURRENTDATE=$(date --date="1 days ago" +%Y-%m-%d)
+	       CURRENTDATECURL=$(date --date="1 days ago" +%d/%m/%Y)
+         CURRENTENDDATECURL=$(date +%d/%m/%Y)
+         
+       # ==================================================
+      # Check the environment                           
+      # ==================================================        
+      - name: "Retrieve Current Environment"
+        env: 
+          AppianUser: <AppianUser>
+          AppianPasswordTEST: <AppianPasswordTEST>
+          AppianPasswordUAT: <AppianPasswordUAT>
+          AppianPasswordPROD: <AppianPasswordPROD>
+          
+        run:  |
+         for env in ${envs[@]};
+         do   
+            if  ${env} == "DEV"
+    	        curlURL="mhradev.appiancloud.com"
+            elif  ${env} == "TEST"
+    	        curlURL="mhratest.appiancloud.com"
+            elif  ${env} == "UAT"
+    	        curlURL="mhrapreprod.appiancloud.com"
+            elif ${env} == "PROD" 
+    	        curlURL="mhrabpm.appiancloud.com"
+            fi
+    
+            echo ""
+            echo -e "\033[35mNow retrieving logs for ${env} environment\033[0m"
+            
+            for  logName in ${logNames[@]};
+	          do
+		        echo ""
+   		      echo "Now Retrieving and Processing Log: ${logName}"
+		        logFileName="${logName}-${CURRENTDATE}.csv" #Concatenate logName and Date into one variable
+           
+             # Retrieval for test environment
+        if [[ ${env} == "TEST" ]];
+            if [ ${logName} == "system" ] || [ ${logName} == "disk_usage" ]
+       		  	curl -s -u ${AppianUser}:${AppianPasswordTEST} -X GET https://${curlURL}/suite/webapi/getcsvlog?file=data-metrics/${logName}.csv&startDate=${CURRENTDATECURL}&endDate=${CURRENTENDDATECURL} >> ${logFileName}
+	    	else 
+				curl -s -u ${AppianUser}:${AppianPasswordTEST} -X GET https://${curlURL}/suite/webapi/getcsvlog?file=perflogs/${logName}.csv&startDate=${CURRENTDATECURL}&endDate=${CURRENTENDDATECURL} >> ${logFileName}
+			fi 
+    	# Retrieval for UAT environment
+        elif [[ ${env} == "UAT" ]];
+            if [ ${logName} == "system" ] || [ ${logName} == "disk_usage" ]
+       		  	curl -s -u ${AppianUser}:${AppianPasswordUAT} -X GET https://${curlURL}/suite/webapi/getcsvlog?file=data-metrics/${logName}.csv&startDate=${CURRENTDATECURL}&endDate=${CURRENTENDDATECURL} >> ${logFileName}
+	    	else 
+				curl -s -u ${AppianUser}:${AppianPasswordUAT} -X GET https://${curlURL}/suite/webapi/getcsvlog?file=perflogs/${logName}.csv&startDate=${CURRENTDATECURL}&endDate=${CURRENTENDDATECURL} >> ${logFileName}
+			fi 
+        # Retrieval for prod environment
+        elif [[ ${env} == "PROD" ]]; then
+            if [ ${logName} == "system" ] || [ ${logName} == "disk_usage" ]
+       		  	curl -s -u ${AppianUser}:${AppianPasswordPROD} -X GET https://${curlURL}/suite/webapi/getcsvlog?file=data-metrics/${logName}.csv&startDate=${CURRENTDATECURL}&endDate=${CURRENTENDDATECURL} >> ${logFileName}
+	    	else 
+				curl -s -u ${AppianUser}:${AppianPasswordPROD} -X GET https://${curlURL}/suite/webapi/getcsvlog?file=perflogs/${logName}.csv&startDate=${CURRENTDATECURL}&endDate=${CURRENTENDDATECURL} >> ${logFileName}
+			fi 
+    	fi
+      
+  - name: 'Retrive Log file is data exists'  
+		 if grep -q "rows" ${logFileName} 
+        echo "Data found in log: Pre-processing file"
+        sed 's/\",\"/\n/g' -i  ${logFileName} # Add newline after every line of the log
+   			sed 's/\:\[\"/\n/g' -i ${logFileName} # Add newline after header
+   			sed 's/\"\],/\n/g' -i ${logFileName} # Add newline after footer
+   			sed '/^[0-9]/!d' -i ${logFileName} # Remove all lines that do not begin with a number
+   			sed -i 's/\\\".*\\\",/operationDetail,/g' ${logFileName}
+        	echo "" >> ${logFileName} # Add trailing newline for line additions
+		
+        	echo "Log file name is: ${logFileName}"
+        
+  			#Log Existence Verification on ELK Machine
+			LogFileExists=($(sshpass -p "${ELK_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no devops-local-admin@10.5.5.206 [ -f "/home/devops-local-admin/appian_logs/${env}/${logName}/${logFileName}" ] && echo true || echo false))
+  
+ - name: 'Log Shipping to ELK Machine'
+ 			if [ ${LogFileExists} == "true" ]; 
+         		echo "LogFile already exists on the machine - Adding Log Changes to Existing File"
+   	 			mv ${logFileName} "new-${logFileName}"
+   	 			sshpass -p "${ELK_VM_PASSWORD}" scp "new-${logFileName}" devops-local-admin@10.5.5.206:/home/devops-local-admin/appian_logs/${env}/${logName}/
+   	 			sshpass -p "${ELK_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no devops-local-admin@10.5.5.206 "comm -13 --nocheck-order /home/devops-local-admin/appian_logs/${env}/${logName}/${logFileName} /home/devops-local-admin/appian_logs/${env}/${logName}/new-${logFileName} >> /home/devops-local-admin/appian_logs/${env}/${logName}/${logFileName}"
+   	 			sshpass -p "${ELK_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no devops-local-admin@10.5.5.206 "rm -rf /home/devops-local-admin/appian_logs/${env}/${logName}/new-${logFileName}" 
+        	elif [ ${LogFileExists} == "false" ]; then
+    			echo "Log File does not already exist on the machine - Adding File"
+    			sshpass -p "${ELK_VM_PASSWORD}" scp "${logFileName}" devops-local-admin@10.5.5.206:/home/devops-local-admin/appian_logs/${env}/${logName}
+  			else 
+    			echo "Something has gone wrong"
+  			fi
+   		else
+   			echo "No data in log: skipping"
+   		fi
+    
+   - name: 'Remove log file for next cycle'
+        rm -f ${logFileName}
+    
+   - name: 'Removal of Logs on ELK machine older than 7 days'
+    sshpass -p "${ELK_VM_PASSWORD}" ssh -o StrictHostKeyChecking=no devops-local-admin@10.5.5.206 "find /home/devops-local-admin/appian_logs/${env}/${logName}/ -type f -name '*.csv' -mtime +7 -exec rm {} \;"      
+    
+    done
+done
+
+        
+     
+	
